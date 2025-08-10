@@ -181,6 +181,16 @@ export default function MonitorPage() {
                 </CardTitle>
               </CardHeader>
               <CardContent className="space-y-6">
+                {/* Not a plant guard */}
+                {diagnosisResult?.raw_results?.kindwise?.is_plant === false ? (
+                  <Alert className="border-yellow-200 bg-yellow-50">
+                    <AlertTriangle className="h-4 w-4 text-yellow-600" />
+                    <AlertDescription className="text-yellow-800">
+                      This image does not appear to be a plant. Please upload a clear photo of a plant leaf or crop for diagnosis.
+                    </AlertDescription>
+                  </Alert>
+                ) : (
+                <>
                 {/* Structured Analysis Section */}
                 {diagnosisResult.structured_insight && typeof diagnosisResult.structured_insight === 'object' ? (
                   <div className="space-y-6">
@@ -634,6 +644,8 @@ export default function MonitorPage() {
                       ))}
                   </div>
                 </div>
+                )}
+                </>
                 )}
               </CardContent>
             </Card>

@@ -19,6 +19,20 @@ async def diagnosis_flow(
     """
 
     combined_result = await predict_crop_health(image_path)
+
+    # If Kindwise confidently indicates this is not a plant, short-circuit with a clear message
+    try:
+        is_plant_flag = combined_result.get("kindwise", {}).get("is_plant", True)
+    except Exception:
+        is_plant_flag = True
+
+    if is_plant_flag is False:
+        return {
+            "insight": (
+                "This image does not appear to be a plant. Please upload a clear photo of a plant leaf or crop for diagnosis."
+            ),
+            "raw_results": combined_result,
+        }
     prompt = (
         "You are an expert agricultural advisor for smallholder farmers.\n"
         "You will receive crop health diagnosis results from different api's.\n"

@@ -514,7 +514,6 @@ Farmer Profile:
                     assistant_text, user_lang
                 )
 
-        
         print("assi: ", assistant_text)
         chat_session_manager.add_message(
             session_id, sender="llm", message=assistant_text
@@ -542,8 +541,6 @@ Provide a brief, helpful answer tailored to the farmer's context."""
         prompt, temperature=0.2, max_output_tokens=280
     )
     llm_text = llm_response.get("response", "")
-
-   
 
     chat_session_manager.add_message(session_id, sender="llm", message=llm_text)
     # Translate LLM response back if needed
