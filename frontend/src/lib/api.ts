@@ -233,9 +233,15 @@ class ApiService {
   }
 
   async sendChatMessage(sessionId: string, message: string, preferredLanguage?: string): Promise<{ response: string }> {
+    // Prefer the current UI language from session storage if not provided
+    let lang = preferredLanguage;
+    if (!lang && typeof window !== 'undefined') {
+      const saved = sessionStorage.getItem('agrilo_preferred_language');
+      if (saved) lang = saved;
+    }
     let url = `/api/chat/send-message?session_id=${sessionId}`;
-    if (preferredLanguage) {
-      url += `&preferred_language=${preferredLanguage}`;
+    if (lang) {
+      url += `&preferred_language=${encodeURIComponent(lang)}`;
     }
     
     return await this.request<{ response: string }>(url, {
@@ -251,9 +257,15 @@ class ApiService {
     language: string; 
     tts_success: boolean; 
   }> {
+    // Prefer the current UI language from session storage if not provided
+    let lang = preferredLanguage;
+    if (!lang && typeof window !== 'undefined') {
+      const saved = sessionStorage.getItem('agrilo_preferred_language');
+      if (saved) lang = saved;
+    }
     let url = `/api/chat/send-voice-message?session_id=${sessionId}`;
-    if (preferredLanguage) {
-      url += `&preferred_language=${preferredLanguage}`;
+    if (lang) {
+      url += `&preferred_language=${encodeURIComponent(lang)}`;
     }
     
     return await this.request<{ 
@@ -278,9 +290,15 @@ class ApiService {
     const formData = new FormData();
     formData.append('audio_file', audioFile);
     
+    // Prefer the current UI language from session storage if not provided
+    let lang = language;
+    if (!lang && typeof window !== 'undefined') {
+      const saved = sessionStorage.getItem('agrilo_preferred_language');
+      if (saved) lang = saved;
+    }
     let url = `${this.baseUrl}/api/chat/send-audio-message?session_id=${sessionId}`;
-    if (language) {
-      url += `&language=${language}`;
+    if (lang) {
+      url += `&language=${encodeURIComponent(lang)}`;
     }
     
     const headers: Record<string, string> = {};
@@ -303,6 +321,44 @@ class ApiService {
     return await response.json();
   }
 
+  async sendImageMessage(
+    sessionId: string,
+    imageFile: File,
+    preferredLanguage?: string
+  ): Promise<{
+    action?: string;
+    response: string;
+    structured_insight?: any;
+    similar_images?: any;
+  }> {
+    const formData = new FormData();
+    formData.append('image', imageFile);
+    // Backend expects these exact field names for multipart form
+    formData.append('session_id_form', sessionId);
+    // message_form is optional; omit or send empty
+
+    // Prefer the current UI language from session storage if not provided
+    let lang = preferredLanguage;
+    if (!lang && typeof window !== 'undefined') {
+      const saved = sessionStorage.getItem('agrilo_preferred_language');
+      if (saved) lang = saved;
+    }
+    let url = `${this.baseUrl}/api/chat/send-message`;
+    if (lang) {
+      url += `?preferred_language=${encodeURIComponent(lang)}`;
+    }
+
+    const headers: Record<string, string> = {};
+    if (this.token) { headers.Authorization = `Bearer ${this.token}`; }
+
+    const resp = await fetch(url, { method: 'POST', headers, body: formData });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      throw new Error(`HTTP ${resp.status}: ${text}`);
+    }
+    return await resp.json();
+  }
+
   async voiceConversation(sessionId: string, audioFile: File, language?: string): Promise<{
     response: string;
     transcribed_text: string;
@@ -316,9 +372,15 @@ class ApiService {
     const formData = new FormData();
     formData.append('audio_file', audioFile);
     
+    // Prefer the current UI language from session storage if not provided
+    let lang = language;
+    if (!lang && typeof window !== 'undefined') {
+      const saved = sessionStorage.getItem('agrilo_preferred_language');
+      if (saved) lang = saved;
+    }
     let url = `${this.baseUrl}/api/chat/voice-conversation?session_id=${sessionId}`;
-    if (language) {
-      url += `&language=${language}`;
+    if (lang) {
+      url += `&language=${encodeURIComponent(lang)}`;
     }
     
     const headers: Record<string, string> = {};
@@ -331,6 +393,78 @@ class ApiService {
     }
     
     return await response.json();
+  }
+
+  // Streaming voice conversation using SSE
+  async voiceConversationStream(
+    sessionId: string,
+    audioFile: File,
+    language: string | undefined,
+    handlers: {
+      onDetectedLanguage?: (data: { detected_language: string; confidence: number; original_language: string; transcribed_text: string }) => void;
+      onResponseText?: (data: { response: string }) => void;
+      onAudio?: (data: { audio_base64?: string; audio_format?: string; language?: string; tts_success?: boolean }) => void;
+      onDone?: () => void;
+      onError?: (error: any) => void;
+    }
+  ): Promise<void> {
+    const formData = new FormData();
+    formData.append('audio_file', audioFile);
+
+    // Prefer the current UI language from session storage if not provided
+    let lang = language;
+    if (!lang && typeof window !== 'undefined') {
+      const saved = sessionStorage.getItem('agrilo_preferred_language');
+      if (saved) lang = saved;
+    }
+    let url = `${this.baseUrl}/api/chat/voice-conversation?session_id=${sessionId}&stream=true`;
+    if (lang) { url += `&language=${encodeURIComponent(lang)}`; }
+
+    const headers: Record<string, string> = {};
+    if (this.token) { headers.Authorization = `Bearer ${this.token}`; }
+
+    try {
+      const response = await fetch(url, { method: 'POST', headers, body: formData });
+      if (!response.ok || !response.body) {
+        const text = await response.text().catch(() => '');
+        throw new Error(`HTTP ${response.status}: ${text}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // Parse SSE blocks separated by double newlines
+        let sepIndex;
+        while ((sepIndex = buffer.indexOf('\n\n')) !== -1) {
+          const block = buffer.slice(0, sepIndex);
+          buffer = buffer.slice(sepIndex + 2);
+
+          const lines = block.split('\n');
+          const eventLine = lines.find(l => l.startsWith('event:')) || '';
+          const dataLine = lines.find(l => l.startsWith('data:')) || '';
+          const event = eventLine.replace('event:', '').trim();
+          const dataRaw = dataLine.replace('data:', '').trim();
+
+          let data: any = {};
+          try { data = dataRaw ? JSON.parse(dataRaw) : {}; } catch {}
+
+          if (event === 'detected_language' && handlers.onDetectedLanguage) handlers.onDetectedLanguage(data);
+          else if (event === 'response_text' && handlers.onResponseText) handlers.onResponseText(data);
+          else if (event === 'audio' && handlers.onAudio) handlers.onAudio(data);
+          else if (event === 'done' && handlers.onDone) handlers.onDone();
+          else if (event === 'error' && handlers.onError) handlers.onError(data);
+        }
+      }
+    } catch (err) {
+      if (handlers.onError) handlers.onError(err);
+      else throw err;
+    }
   }
 
   async getChatHistory(sessionId: string): Promise<{ messages: ChatMessage[] }> {

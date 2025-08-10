@@ -1,6 +1,17 @@
 import re
+import json
 import requests
-from fastapi import APIRouter, HTTPException, Query, Depends, UploadFile, File
+from fastapi import (
+    APIRouter,
+    HTTPException,
+    Query,
+    Depends,
+    UploadFile,
+    File,
+    Form,
+    Request,
+)
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 from src.services.chat_service import chat_session_manager
@@ -12,6 +23,9 @@ from src.services.llm_service import llm_service
 from src.services.audio_service import audio_service
 from src.services.tts_service import tts_service
 from src.auth.auth_utils import get_current_user
+from src.flows import diagnosis_flow, recommend_crops_flow
+import tempfile
+import os
 
 
 def clean_text_for_tts(text: str) -> str:
@@ -44,6 +58,45 @@ def clean_text_for_tts(text: str) -> str:
     text = text.strip()  # Remove leading/trailing whitespace
 
     return text
+
+
+def _sse(event: str, data: dict) -> bytes:
+    """Format a Server-Sent Event line."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode("utf-8")
+
+
+def auto_compact_text(
+    text: str, max_sentences: int = 3, max_bullets: int = 5, max_chars: int = 800
+) -> str:
+    """Compact verbose text to be concise for chat/tts."""
+    if not text:
+        return text
+    text = text.strip()
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    has_bullets = any(ln.lstrip().startswith(("-", "*", "•", "–")) for ln in lines)
+    if has_bullets:
+        intro = None
+        bullets = []
+        for ln in lines:
+            if not ln.strip():
+                continue
+            if ln.lstrip().startswith(("-", "*", "•", "–")):
+                bullets.append(ln)
+            elif intro is None:
+                intro = ln
+        compact_lines = []
+        if intro:
+            compact_lines.append(intro)
+        if bullets:
+            compact_lines.extend(bullets[:max_bullets])
+        compact = "\n".join(compact_lines).strip()
+    else:
+        # Keep first few sentences
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        compact = " ".join(sentences[:max_sentences]).strip()
+    if len(compact) > max_chars:
+        compact = compact[:max_chars].rsplit(" ", 1)[0] + "…"
+    return compact
 
 
 def reverse_geocode(lat: float, lon: float) -> dict:
@@ -139,6 +192,96 @@ def clean_location_for_display(location: str) -> str:
         return location.strip()
 
 
+def parse_lat_lon_from_location(location: str) -> tuple[float, float] | None:
+    """Parse latitude and longitude from a location string like '9.145, 40.489'."""
+    if not location:
+        return None
+    try:
+        import re
+
+        m = re.search(r"([+-]?[0-9]*\.?[0-9]+)\s*,\s*([+-]?[0-9]*\.?[0-9]+)", location)
+        if not m:
+            return None
+        lat = float(m.group(1))
+        lon = float(m.group(2))
+        return (lat, lon)
+    except Exception:
+        return None
+
+
+def detect_intent(message_en: str) -> str:
+    """Detect user intent using the LLM. Returns one of:
+    'crop_recommendation' | 'diagnosis' | 'fertilizer_recommendation' | 'general'.
+    Falls back to 'general' if unsure.
+    """
+    try:
+        # Keep prompt small and deterministic
+        prompt = (
+            "Classify the user's request into one of these intents only: "
+            "crop_recommendation, diagnosis, fertilizer_recommendation, general.\n"
+            "Rules:\n"
+            "- crop_recommendation: asking what to plant, best crops, crop suggestions for location/season.\n"
+            "- diagnosis: crop disease/health issues, image-based help, symptoms.\n"
+            "- fertilizer_recommendation: fertilizer plan, NPK, dosage, when/how to apply.\n"
+            "- general: everything else.\n\n"
+            f"User: {message_en}\n\n"
+            'Respond with ONLY JSON like {"intent": "crop_recommendation"}.'
+        )
+        resp = llm_service.send_message(prompt, temperature=0.0, max_output_tokens=24)
+        data = resp.get("response", "{}")
+        import json, re
+
+        m = re.search(r"\{.*\}", data, re.DOTALL)
+        if m:
+            data = m.group(0)
+        parsed = json.loads(data)
+        intent_raw = (parsed.get("intent") or "").strip().lower()
+        # Normalize common typos/synonyms
+        normalized = intent_raw.replace(" ", "_").replace("-", "_")
+        if normalized in (
+            "croprecommendation",
+            "croprecommendatino",
+            "crop_recommendation",
+        ):
+            normalized = "crop_recommendation"
+        elif normalized in ("fertilizer", "fertiliser", "fertilizer_recommendation"):
+            normalized = "fertilizer_recommendation"
+        if normalized in {
+            "crop_recommendation",
+            "diagnosis",
+            "fertilizer_recommendation",
+            "general",
+        }:
+            return normalized
+        # Fallback heuristic
+        mlc = (message_en or "").lower()
+        if (
+            ("recommend" in mlc and ("crop" in mlc or "plant" in mlc))
+            or ("what to plant" in mlc)
+            or ("best crop" in mlc)
+        ):
+            return "crop_recommendation"
+        if any(
+            k in mlc
+            for k in [
+                "disease",
+                "blight",
+                "symptom",
+                "leaf spot",
+                "diagnos",
+                "unhealthy",
+            ]
+        ):
+            return "diagnosis"
+        if any(
+            k in mlc for k in ["fertilizer", "fertiliser", "npk", "dosage", "apply"]
+        ):
+            return "fertilizer_recommendation"
+        return "general"
+    except Exception:
+        return "general"
+
+
 router = APIRouter(prefix="/api/chat", tags=["Chat"])
 
 
@@ -163,13 +306,30 @@ def start_session(req: StartSessionRequest, current_user=Depends(get_current_use
 
 @router.post("/send-message")
 async def send_message(
-    req: SendMessageRequest,
+    request: Request,
+    session_id_form: Optional[str] = Form(None),
+    message_form: Optional[str] = Form(None),
+    image: Optional[UploadFile] = File(None),
     preferred_language: Optional[str] = Query(
         None, description="Preferred language for conversation"
     ),
     current_user=Depends(get_current_user),
 ):
-    session = chat_session_manager.get_session(req.session_id)
+    # Support both JSON body and multipart form
+    session_id: Optional[str] = session_id_form
+    message: Optional[str] = message_form
+    if session_id is None and message is None and image is None:
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        session_id = data.get("session_id")
+        message = data.get("message")
+
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
+
+    session = chat_session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -180,25 +340,26 @@ async def send_message(
     else:
         # Detect language using main service, fallback if error
         try:
-            user_lang = translation_service.detect_language(req.message)
+            user_lang = translation_service.detect_language(message or "")
         except Exception:
-            user_lang = translation_fallback_service.detect_language(req.message)
+            user_lang = translation_fallback_service.detect_language(message or "")
         print(f"🌍 Detected language: {user_lang}")
 
-    message_for_llm = req.message
+    message_for_llm = message or ""
     needs_translation = user_lang != "en"
     if needs_translation:
         try:
-            message_for_llm = translation_service.translate_to_english(req.message)
+            message_for_llm = translation_service.translate_to_english(message_for_llm)
         except Exception:
             message_for_llm = translation_fallback_service.translate_to_english(
-                req.message
+                message_for_llm
             )
 
     # Add user message
-    chat_session_manager.add_message(
-        req.session_id, sender="user", message=message_for_llm
-    )
+    if message_for_llm:
+        chat_session_manager.add_message(
+            session_id, sender="user", message=message_for_llm
+        )
 
     messages_formatted = "\n".join(
         [f"{m.sender}: {m.message}" for m in session.messages[-10:]]
@@ -216,25 +377,175 @@ Farmer Profile:
 - Crops Grown: {current_user.crops_grown}
 """
 
-    prompt = f"""You are an agricultural assistant AI helping farmers with their questions.
-Respond directly to the user's query with helpful agricultural information.
-Do not mention that you're playing a role or waiting for input.
-If the user greets you, respond with a friendly greeting and offer to help with agricultural topics.
+    # If an image is provided, run the diagnosis flow (function-calling behavior)
+    temp_image_path = None
+    if image is not None:
+        if not image.content_type or not image.content_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail="File must be an image")
+        try:
+            suffix = os.path.splitext(image.filename or "upload.jpg")[1] or ".jpg"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(await image.read())
+                temp_image_path = tmp.name
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Error saving image: {str(e)}")
+
+        try:
+            result = await diagnosis_flow(temp_image_path)
+        finally:
+            try:
+                if temp_image_path and os.path.exists(temp_image_path):
+                    os.remove(temp_image_path)
+            except Exception:
+                pass
+
+        structured = result.get("structured_insight")
+        if structured:
+            problems = structured.get("identified_problems", []) or []
+            overall = structured.get("overall_health") or "Unknown"
+            severity = structured.get("severity_level") or "Unknown"
+            recs = structured.get("recommended_actions", []) or []
+
+            # Clean items and remove trailing punctuation artifacts
+            def _clean_list(items):
+                cleaned = []
+                for it in items:
+                    if not isinstance(it, str):
+                        it = str(it)
+                    it = it.strip().rstrip(",")
+                    if it:
+                        cleaned.append(it)
+                return cleaned
+
+            problems = _clean_list(problems)[:5]
+            recs = _clean_list(recs)[:5]
+
+            # Markdown-formatted, scannable summary
+            md_lines = [
+                f"**Overall:** {overall}",
+                f"**Severity:** {severity}",
+            ]
+            if problems:
+                md_lines.append("\n**Problems**:")
+                md_lines.extend([f"- {p}" for p in problems])
+            if recs:
+                md_lines.append("\n**Next steps**:")
+                md_lines.extend([f"- {r}" for r in recs])
+            assistant_text = "\n".join(md_lines) or "Diagnosis completed."
+        else:
+            assistant_text = result.get("insight") or "Diagnosis completed."
+
+        # Translate back to user's preferred language if needed
+        try:
+            needs_translation = user_lang != "en"
+        except NameError:
+            needs_translation = False
+        if needs_translation and assistant_text:
+            try:
+                assistant_text = translation_service.translate_from_english(
+                    assistant_text, user_lang
+                )
+            except Exception:
+                assistant_text = translation_fallback_service.translate_from_english(
+                    assistant_text, user_lang
+                )
+        chat_session_manager.add_message(
+            session_id, sender="llm", message=assistant_text
+        )
+
+        raw_results = result.get("raw_results", {})
+        kindwise = raw_results.get("kindwise", {})
+        diseases = kindwise.get("diseases", [])
+        crops = kindwise.get("crops", [])
+        similar_images = {
+            "diseases": [
+                {
+                    "name": d.get("name"),
+                    "similar_images": d.get("similar_images", [])[:6],
+                }
+                for d in diseases
+                if d.get("similar_images")
+            ][:3],
+            "crops": [
+                {
+                    "name": c.get("name"),
+                    "similar_images": c.get("similar_images", [])[:6],
+                }
+                for c in crops
+                if c.get("similar_images")
+            ][:3],
+        }
+
+        return {
+            "action": "diagnose_crop",
+            "response": assistant_text,
+            "structured_insight": structured,
+            "similar_images": similar_images,
+        }
+
+    # General answer when no image is provided
+    # LLM-based intent detection
+    intent = detect_intent(message_for_llm or "")
+    if intent == "crop_recommendation":
+        coords = parse_lat_lon_from_location(current_user.location)
+        if not coords:
+            # Default to Ethiopia center if unavailable
+            coords = (9.145, 40.489)
+        lat, lon = coords
+
+        try:
+            reco = await recommend_crops_flow(lat, lon, past_days=30, forecast_days=14)
+            print("reco", reco)
+            assistant_text = (
+                reco.get("recommendation")
+                or "Here are crop suggestions based on your area."
+            )
+        except Exception as exc:
+            assistant_text = "I couldn't fetch crop recommendations right now. Please try again shortly."
+
+        # Translate back if needed
+        if needs_translation and assistant_text:
+            try:
+                assistant_text = translation_service.translate_from_english(
+                    assistant_text, user_lang
+                )
+            except Exception:
+                assistant_text = translation_fallback_service.translate_from_english(
+                    assistant_text, user_lang
+                )
+
+        
+        print("assi: ", assistant_text)
+        chat_session_manager.add_message(
+            session_id, sender="llm", message=assistant_text
+        )
+        return {"response": assistant_text}
+
+    prompt = f"""You are an agricultural assistant helping farmers.
+Reply policy:
+- Be concise by default.
+- If the user asks for diagnosis or mentions disease/symptoms, instruct them briefly to attach or take a clear photo of the affected plant using the camera button in the chat, then wait for the image.
+- If the question is vague, ask one brief clarifying question.
+- Use simple, direct language suited for farmers.
 
 {farmer_info}
 
 Conversation history:
 {messages_formatted}
 
-current user message:
+User message:
 {message_for_llm}
 
-Respond as the agricultural assistant, taking into account the farmer's specific profile, location, experience level, and crops. Provide personalized advice that considers their farming context."""
+Provide a brief, helpful answer tailored to the farmer's context."""
 
-    llm_response = llm_service.send_message(prompt)
+    llm_response = llm_service.send_message(
+        prompt, temperature=0.2, max_output_tokens=280
+    )
     llm_text = llm_response.get("response", "")
 
-    chat_session_manager.add_message(req.session_id, sender="llm", message=llm_text)
+   
+
+    chat_session_manager.add_message(session_id, sender="llm", message=llm_text)
     # Translate LLM response back if needed
     if needs_translation and llm_text:
         try:
@@ -244,6 +555,7 @@ Respond as the agricultural assistant, taking into account the farmer's specific
                 llm_text, user_lang
             )
 
+    llm_text = auto_compact_text(llm_text)
     return {"response": llm_text}
 
 
@@ -305,22 +617,25 @@ Farmer Profile:
 - Crops Grown: {current_user.crops_grown}
 """
 
-    prompt = f"""You are an agricultural assistant AI helping farmers with their questions.
-Respond directly to the user's query with helpful agricultural information.
-Do not mention that you're playing a role or waiting for input.
-If the user greets you, respond with a friendly greeting and offer to help with agricultural topics.
+    prompt = f"""You are an agricultural assistant helping farmers.
+Reply policy:
+- Be concise by default (1–3 sentences). Avoid small talk and generic disclaimers.
+- If the question is vague, ask one brief clarifying question.
+- Use simple, direct language suited for farmers.
 
 {farmer_info}
 
 Conversation history:
 {messages_formatted}
 
-current user message:
+User message:
 {message_for_llm}
 
-Respond as the agricultural assistant, taking into account the farmer's specific profile, location, experience level, and crops. Provide personalized advice that considers their farming context."""
+Provide a brief, helpful answer tailored to the farmer's context."""
 
-    llm_response = llm_service.send_message(prompt)
+    llm_response = llm_service.send_message(
+        prompt, temperature=0.2, max_output_tokens=280
+    )
     llm_text = llm_response.get("response", "")
 
     chat_session_manager.add_message(req.session_id, sender="llm", message=llm_text)
@@ -334,7 +649,8 @@ Respond as the agricultural assistant, taking into account the farmer's specific
                 llm_text, user_lang
             )
 
-    # Clean text for TTS to remove formatting characters
+    # Auto-compact verbosity, then clean text for TTS
+    llm_text = auto_compact_text(llm_text)
     cleaned_text = clean_text_for_tts(llm_text)
 
     # Convert text to speech
@@ -443,23 +759,28 @@ Farmer Profile:
 """
 
     # Use the same prompt as text messages
-    prompt = f"""You are an agricultural assistant AI helping farmers with their questions.
-Respond directly to the user's query with helpful agricultural information.
-Do not mention that you're playing a role or waiting for input.
-If the user greets you, respond with a friendly greeting and offer to help with agricultural topics.
+    prompt = f"""You are an agricultural assistant helping farmers.
+Reply policy:
+- Be concise by default.
+- If the user asks for diagnosis or mentions disease/symptoms, instruct them briefly to attach or take a clear photo of the affected plant using the camera button in the chat, then wait for the image.
+- If the question is vague, ask one brief clarifying question.
+- Use simple, direct language suited for farmers.You are an agricultural assistant helping farmers.
+Reply policy:
 
 {farmer_info}
 
 Conversation history:
 {messages_formatted}
 
-current user message:
+User message:
 {message_for_llm}
 
-Respond as the agricultural assistant, taking into account the farmer's specific profile, location, experience level, and crops. Provide personalized advice that considers their farming context."""
+Provide a brief, helpful answer tailored to the farmer's context."""
 
     # Get LLM response
-    llm_response = llm_service.send_message(prompt)
+    llm_response = llm_service.send_message(
+        prompt, temperature=0.2, max_output_tokens=280
+    )
     llm_text = llm_response.get("response", "")
 
     # Add LLM response to chat session
@@ -489,6 +810,10 @@ async def voice_conversation(
     audio_file: UploadFile = File(...),
     language: Optional[str] = Query(
         None, description="Language code (en, am, no, sw, es, id)"
+    ),
+    stream: Optional[bool] = Query(
+        False,
+        description="If true, stream SSE events: detected_language, response_text, audio, done",
     ),
     current_user=Depends(get_current_user),
 ):
@@ -543,9 +868,115 @@ async def voice_conversation(
     user_lang = language if language else detected_language
     print(f"🎤 Using language: {user_lang}")
 
+    # If streaming is requested, send SSE events progressively
+    if stream:
+
+        def event_generator():
+            try:
+                # Initial language/transcript event
+                yield _sse(
+                    "detected_language",
+                    {
+                        "detected_language": detected_language,
+                        "confidence": confidence,
+                        "original_language": user_lang,
+                        "transcribed_text": transcribed_text,
+                    },
+                )
+
+                # Prepare LLM input
+                message_for_llm_local = transcribed_text
+                needs_translation_local = user_lang != "en"
+                if needs_translation_local:
+                    try:
+                        message_for_llm_local = (
+                            translation_service.translate_to_english(transcribed_text)
+                        )
+                    except Exception:
+                        message_for_llm_local = (
+                            translation_fallback_service.translate_to_english(
+                                transcribed_text
+                            )
+                        )
+
+                chat_session_manager.add_message(
+                    session_id, sender="user", message=message_for_llm_local
+                )
+                messages_formatted_local = "\n".join(
+                    [f"{m.sender}: {m.message}" for m in session.messages[-10:]]
+                )
+                farmer_info_local = f"""
+Farmer Profile:
+- Name: {current_user.name}
+- Location: {clean_location_for_display(current_user.location)}
+- Experience: {current_user.years_experience} years
+- User Type: {current_user.user_type}
+- Main Goal: {current_user.main_goal}
+- Preferred Language: {current_user.preferred_language}
+- Crops Grown: {current_user.crops_grown}
+"""
+                prompt_local = f"""You are an agricultural assistant helping farmers.
+Reply policy:
+- Be concise by default.
+- If the user asks for diagnosis or mentions disease/symptoms, instruct them briefly to attach or take a clear photo of the affected plant using the camera button in the chat, then wait for the image.
+- If the question is vague, ask one brief clarifying question.
+- Use simple, direct language suited for farmers.
+
+{farmer_info_local}
+
+Conversation history:
+{messages_formatted_local}
+
+current user message:
+{message_for_llm_local}
+
+Respond as the agricultural assistant, taking into account the farmer's specific profile, location, experience level, and crops. Provide personalized advice that considers their farming context."""
+
+                llm_response_local = llm_service.send_message(prompt_local)
+                llm_text_local = llm_response_local.get("response", "")
+                chat_session_manager.add_message(
+                    session_id, sender="llm", message=llm_text_local
+                )
+
+                if needs_translation_local and llm_text_local:
+                    try:
+                        llm_text_local = translation_service.translate_from_english(
+                            llm_text_local, user_lang
+                        )
+                    except Exception:
+                        llm_text_local = (
+                            translation_fallback_service.translate_from_english(
+                                llm_text_local, user_lang
+                            )
+                        )
+
+                llm_text_local = auto_compact_text(llm_text_local)
+                yield _sse("response_text", {"response": llm_text_local})
+
+                cleaned_text_local = clean_text_for_tts(llm_text_local)
+                tts_result_local = tts_service.text_to_speech(
+                    cleaned_text_local, user_lang
+                )
+
+                yield _sse(
+                    "audio",
+                    {
+                        "audio_base64": tts_result_local.get("audio_base64"),
+                        "audio_format": tts_result_local.get("audio_format"),
+                        "language": user_lang,
+                        "tts_success": tts_result_local.get("success", False),
+                    },
+                )
+
+                yield _sse("done", {"ok": True})
+            except Exception as exc:
+                yield _sse("error", {"message": str(exc)})
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+    # Non-streaming path (original behavior)
     message_for_llm = transcribed_text
     needs_translation = user_lang != "en"
-
     if needs_translation:
         try:
             message_for_llm = translation_service.translate_to_english(transcribed_text)
@@ -554,15 +985,10 @@ async def voice_conversation(
                 transcribed_text
             )
 
-    # Add user message to chat session
     chat_session_manager.add_message(session_id, sender="user", message=message_for_llm)
-
-    # Format conversation history
     messages_formatted = "\n".join(
         [f"{m.sender}: {m.message}" for m in session.messages[-10:]]
     )
-
-    # Get farmer's personalized information
     farmer_info = f"""
 Farmer Profile:
 - Name: {current_user.name}
@@ -573,12 +999,13 @@ Farmer Profile:
 - Preferred Language: {current_user.preferred_language}
 - Crops Grown: {current_user.crops_grown}
 """
-
-    # Use the same prompt as text messages
-    prompt = f"""You are an agricultural assistant AI helping farmers with their questions.
-Respond directly to the user's query with helpful agricultural information.
-Do not mention that you're playing a role or waiting for input.
-If the user greets you, respond with a friendly greeting and offer to help with agricultural topics.
+    prompt = f"""You are an agricultural assistant helping farmers.
+Reply policy:
+- Be concise by default.
+- If the user asks for diagnosis or mentions disease/symptoms, instruct them briefly to attach or take a clear photo of the affected plant using the camera button in the chat, then wait for the image.
+- If the question is vague, ask one brief clarifying question.
+- Use simple, direct language suited for farmers.You are an agricultural assistant helping farmers.
+Reply policy:
 
 {farmer_info}
 
@@ -589,15 +1016,9 @@ current user message:
 {message_for_llm}
 
 Respond as the agricultural assistant, taking into account the farmer's specific profile, location, experience level, and crops. Provide personalized advice that considers their farming context."""
-
-    # Get LLM response
     llm_response = llm_service.send_message(prompt)
     llm_text = llm_response.get("response", "")
-
-    # Add LLM response to chat session
     chat_session_manager.add_message(session_id, sender="llm", message=llm_text)
-
-    # Translate LLM response back if needed
     if needs_translation and llm_text:
         try:
             llm_text = translation_service.translate_from_english(llm_text, user_lang)
@@ -605,18 +1026,9 @@ Respond as the agricultural assistant, taking into account the farmer's specific
             llm_text = translation_fallback_service.translate_from_english(
                 llm_text, user_lang
             )
-
-    # Clean text for TTS to remove formatting characters
+    llm_text = auto_compact_text(llm_text)
     cleaned_text = clean_text_for_tts(llm_text)
-
-    # Convert AI response to speech
-    print(f"🔊 Converting text to speech for language: {user_lang}")
-    print(f"🔊 Text to convert: {cleaned_text[:100]}...")
-
     tts_result = tts_service.text_to_speech(cleaned_text, user_lang)
-
-    print(f"🔊 TTS result: {tts_result}")
-
     return {
         "response": llm_text,
         "transcribed_text": transcribed_text,

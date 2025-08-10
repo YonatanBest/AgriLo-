@@ -151,8 +151,9 @@ async def recommend_crops_flow(
         f"- Average evapotranspiration: {weather_summary.get('avg_evapotranspiration')}\n"
         "\nBased on this information, recommend the 2-3 most suitable crops to plant now. For each crop, explain why it is suitable, and give 1-2 practical tips for success. Be specific, practical, and use simple language for a smallholder farmer."
     )
-
-    llm_response = llm_service.send_message(prompt)
+    llm_services = LLMService()
+    llm_response = llm_services.send_message(prompt)
+    print("llm: ", llm_response, llm_response.get("response"))
 
     return {
         "recommendation": llm_response.get("response"),

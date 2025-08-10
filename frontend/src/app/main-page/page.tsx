@@ -1,7 +1,7 @@
 "use client"
 
 import { useState, useEffect } from "react"
-import { Home, Activity, MessageCircle, Calendar, User, Sprout, Leaf, LogOut, Settings, Globe } from "lucide-react"
+import { Home, Activity, MessageCircle, Calendar, User, Sprout, Leaf, LogOut, Settings, Globe, Menu } from "lucide-react"
 import { useAuth } from "@/contexts/AuthContext"
 import { useLanguage, SUPPORTED_LANGUAGES } from "@/contexts/LanguageContext"
 import { useRouter } from "next/navigation"
@@ -24,6 +24,7 @@ import {
 import { Separator } from "@/components/ui/separator"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet"
 import {
   Tooltip,
   TooltipContent,
@@ -40,7 +41,7 @@ export default function AgriApp() {
   const { user, isAuthenticated, isLoading, logout } = useAuth()
   const { selectedLanguage, setSelectedLanguage, t } = useLanguage()
   const router = useRouter()
-  const [currentPage, setCurrentPage] = useState("home")
+  const [currentPage, setCurrentPage] = useState("chat")
   const [showLanguageDropdown, setShowLanguageDropdown] = useState(false)
   const [showLogoutDialog, setShowLogoutDialog] = useState(false)
 
@@ -133,9 +134,48 @@ export default function AgriApp() {
       <div className="md:hidden min-h-screen bg-gradient-to-br from-green-50 to-green-100">
         {/* Mobile Header */}
         <header className="bg-white border-b border-green-100 shadow-sm relative z-[9998]">
-          
           <div className="px-4 py-3 flex items-center justify-between">
-            <h1 className="text-2xl font-bold text-green-700 flex items-center gap-2">Agrilo</h1>
+            <div className="flex items-center gap-3">
+              {/* Mobile Navigation Drawer */}
+              <Sheet>
+                <SheetTrigger asChild>
+                  <Button variant="ghost" size="sm" className="rounded-full p-2 text-green-600 hover:bg-green-50">
+                    <Menu className="h-5 w-5" />
+                  </Button>
+                </SheetTrigger>
+                <SheetContent side="left" className="bg-white">
+                  <SheetHeader>
+                    <SheetTitle className="text-green-700">Agrilo</SheetTitle>
+                  </SheetHeader>
+                  <div className="p-2 space-y-1">
+                    {(
+                      [
+                        { id: "chat", label: t("chat"), icon: MessageCircle },
+                        { id: "home", label: t("home"), icon: Home },
+                        { id: "monitor", label: t("monitor"), icon: Activity },
+                        { id: "calendar", label: t("calendar"), icon: Calendar },
+                      ] as const
+                    ).map((item) => {
+                      const Icon = item.icon
+                      const active = currentPage === item.id
+                      return (
+                        <Button
+                          key={item.id}
+                          variant={active ? "default" : "outline"}
+                          size="sm"
+                          className={`w-full justify-start rounded-xl ${active ? "bg-green-500 text-white" : "text-green-700 border-green-200"}`}
+                          onClick={() => setCurrentPage(item.id)}
+                        >
+                          <Icon className="h-4 w-4 mr-2" />
+                          {item.label}
+                        </Button>
+                      )
+                    })}
+                  </div>
+                </SheetContent>
+              </Sheet>
+              <h1 className="text-2xl font-bold text-green-700 flex items-center gap-2">Agrilo</h1>
+            </div>
             <div className="flex items-center gap-2">
               {/* Language Selector */}
               <div className="relative language-dropdown">
@@ -195,31 +235,7 @@ export default function AgriApp() {
         </header>
 
         {/* Mobile Main Content */}
-        <main className="pb-20">{pages[currentPage as keyof typeof pages]}</main>
-
-        {/* Mobile Bottom Navigation */}
-        <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-green-100 shadow-lg">
-          <div className="flex justify-around py-2">
-            {navItems.map((item) => {
-              const Icon = item.icon
-              const isActive = currentPage === item.id
-              return (
-                <Button
-                  key={item.id}
-                  variant={isActive ? "default" : "ghost"}
-                  size="sm"
-                  onClick={() => setCurrentPage(item.id)}
-                  className={`flex flex-col items-center gap-1 h-auto py-2 px-3 rounded-2xl ${
-                    isActive ? "bg-green-500 text-white shadow-lg" : "text-green-600 hover:bg-green-50"
-                  }`}
-                >
-                  <Icon className="h-5 w-5" />
-                  <span className="text-xs font-medium">{item.label}</span>
-                </Button>
-              )
-            })}
-          </div>
-        </nav>
+        <main className="pb-2">{pages[currentPage as keyof typeof pages]}</main>
       </div>
 
       {/* Desktop/Tablet Layout with Sidebar */}

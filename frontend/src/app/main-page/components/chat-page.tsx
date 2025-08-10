@@ -1,11 +1,11 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
-import { Send, Bot, User, Wifi, WifiOff, Mic, Paperclip, MoreVertical, Lightbulb, Clock, Leaf, Droplets, Bug, Thermometer, Globe, Volume2, VolumeX } from "lucide-react"
+import { Send, Bot, User, Wifi, WifiOff, Mic, Paperclip, MoreVertical, Lightbulb, Clock, Leaf, Droplets, Bug, Thermometer, Volume2, VolumeX, Camera, ExternalLink } from "lucide-react"
 import { apiService } from "@/lib/api"
 import { useAuth } from "@/contexts/AuthContext"
 import { useLanguage, SUPPORTED_LANGUAGES } from "@/contexts/LanguageContext"
@@ -31,24 +31,6 @@ export default function ChatPage() {
     }
   }, [selectedLanguage])
   const [isOnline, setIsOnline] = useState(true)
-  const [showMobileDropdown, setShowMobileDropdown] = useState(false)
-  const [showDesktopDropdown, setShowDesktopDropdown] = useState(false)
-
-  // Close dropdowns when clicking outside
-  useEffect(() => {
-    const handleClickOutside = (event: MouseEvent) => {
-      const target = event.target as Element;
-      if (!target.closest('.language-dropdown-container')) {
-        setShowMobileDropdown(false);
-        setShowDesktopDropdown(false);
-      }
-    };
-
-    document.addEventListener('mousedown', handleClickOutside);
-    return () => {
-      document.removeEventListener('mousedown', handleClickOutside);
-    };
-  }, []);
   const [message, setMessage] = useState("")
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(false)
@@ -57,11 +39,14 @@ export default function ChatPage() {
   const [recordingTime, setRecordingTime] = useState(0)
   const [isVoiceMode, setIsVoiceMode] = useState(false)
   const [isPlayingAudio, setIsPlayingAudio] = useState(false)
+  const cameraInputRef = useRef<HTMLInputElement>(null)
   const [messages, setMessages] = useState<Array<{
     id: number;
     type: "bot" | "user";
     content: string;
     time: string;
+    images?: Array<{ url: string; label?: string; citation?: string }>; // optional gallery for bot
+    sectionTitle?: string;
   }>>([
     {
       id: 1,
@@ -301,6 +286,85 @@ export default function ChatPage() {
     setMessage(question)
   }
 
+  // Camera capture handlers
+  const openCamera = () => {
+    cameraInputRef.current?.click()
+  }
+
+  const handleCameraCapture = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    if (!file) return
+    const imageUrl = URL.createObjectURL(file)
+
+    const newMessage = {
+      id: Date.now(),
+      type: "user" as const,
+      content: imageUrl,
+      time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    }
+    setMessages(prev => [...prev, newMessage])
+
+    // Send to backend for diagnosis/response
+    if (sessionId) {
+      setIsLoading(true)
+      apiService
+        .sendImageMessage(sessionId, file, selectedLanguage)
+        .then((res) => {
+          const botMsg = {
+            id: Date.now() + 1,
+            type: "bot" as const,
+            content: res.response,
+            time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+          }
+          const gallery: Array<{ url: string; label?: string; citation?: string }> = []
+          if (res.similar_images) {
+            if (Array.isArray(res.similar_images.diseases)) {
+              res.similar_images.diseases.forEach((d: any) => {
+                (d.similar_images || []).forEach((img: any) => {
+                  if (img?.url) gallery.push({ url: img.url, label: `${d.name || 'Disease'}`, citation: img.citation })
+                })
+              })
+            }
+            if (Array.isArray(res.similar_images.crops)) {
+              res.similar_images.crops.forEach((c: any) => {
+                (c.similar_images || []).forEach((img: any) => {
+                  if (img?.url) gallery.push({ url: img.url, label: `${c.name || 'Crop'}`, citation: img.citation })
+                })
+              })
+            }
+          }
+
+          if (gallery.length > 0) {
+            const galleryMsg = {
+              id: Date.now() + 2,
+              type: "bot" as const,
+              content: "", // gallery-only message
+              time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+              images: gallery,
+              sectionTitle: "Similar cases",
+            }
+            setMessages(prev => [...prev, botMsg, galleryMsg])
+          } else {
+            setMessages(prev => [...prev, botMsg])
+          }
+        })
+        .catch((err) => {
+          console.error('Failed to send image message:', err)
+          const botErr = {
+            id: Date.now() + 2,
+            type: "bot" as const,
+            content: t("connectionError"),
+            time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+          }
+          setMessages(prev => [...prev, botErr])
+        })
+        .finally(() => setIsLoading(false))
+    }
+
+    // Allow selecting the same file again
+    event.currentTarget.value = ""
+  }
+
   // Audio recording functions
   const startRecording = async () => {
     try {
@@ -425,46 +489,44 @@ export default function ChatPage() {
     setIsLoading(true)
 
     try {
-      // Use voice conversation for real-time voice-to-voice chat
-      const response = await apiService.voiceConversation(sessionId, audioFile, selectedLanguage)
-
-      // Add transcribed message
-      const transcribedMessage = {
-        id: messages.length + 1,
-        type: "user" as const,
-        content: response.transcribed_text,
-        time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-      }
-
-      setMessages(prev => [...prev, transcribedMessage])
-
-      // Add AI response
-      const botResponse = {
-        id: messages.length + 2,
-        type: "bot" as const,
-        content: response.response,
-        time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-      }
-
-      setMessages(prev => [...prev, botResponse])
-
-      // Play audio response if available
-      console.log('🔊 Audio response received:', {
-        hasAudio: !!response.audio_base64,
-        ttsSuccess: response.tts_success,
-        audioLength: response.audio_base64?.length || 0,
-        language: response.original_language
-      })
-
-      if (response.audio_base64 && response.tts_success) {
-        console.log('🔊 Playing audio response...')
-        await playAudioResponse(response.audio_base64)
-      } else {
-        console.log('🔊 No audio response available:', {
-          audio_base64: !!response.audio_base64,
-          tts_success: response.tts_success
-        })
-      }
+      // Use streaming to surface detected language early
+      await apiService.voiceConversationStream(
+        sessionId,
+        audioFile,
+        selectedLanguage,
+        {
+          onDetectedLanguage: (data) => {
+            // Show transcribed text immediately
+            const transcribedMessage = {
+              id: Date.now(),
+              type: "user" as const,
+              content: data.transcribed_text,
+              time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+            }
+            setMessages(prev => [...prev, transcribedMessage])
+          },
+          onResponseText: (data) => {
+            const botResponse = {
+              id: Date.now() + 1,
+              type: "bot" as const,
+              content: data.response,
+              time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+            }
+            setMessages(prev => [...prev, botResponse])
+          },
+          onAudio: async (data) => {
+            if (data.audio_base64 && data.tts_success) {
+              await playAudioResponse(data.audio_base64)
+            }
+          },
+          onDone: () => {
+            // no-op; handled by message/audio handlers
+          },
+          onError: (err) => {
+            console.error('Streaming voice error:', err)
+          }
+        }
+      )
     } catch (error) {
       console.error('Failed to send audio message:', error)
 
@@ -509,7 +571,7 @@ export default function ChatPage() {
     <>
 
       {/* Mobile Layout */}
-      <div className="md:hidden p-4 space-y-4 h-[calc(100vh-140px)] flex flex-col">
+      <div className="md:hidden p-4 space-y-4 h-[calc(100vh-100px)] flex flex-col">
 
         {/* Mobile Chat Messages */}
         <Card className="flex-1 rounded-2xl border-2 border-green-100 shadow-lg overflow-visible">
@@ -557,9 +619,35 @@ export default function ChatPage() {
                             >
                               {msg.content}
                             </ReactMarkdown>
+                            {msg.images && msg.images.length > 0 && (
+                              <div className="mt-3">
+                                {msg.sectionTitle && (
+                                  <p className="text-xs font-semibold text-green-800 mb-2">{msg.sectionTitle}</p>
+                                )}
+                                <div className="grid grid-cols-2 gap-2">
+                                  {msg.images.map((it, idx) => (
+                                    <a key={idx} href={it.url} target="_blank" rel="noopener noreferrer" className="block group">
+                                      <div className="relative">
+                                        <img src={it.url} alt={it.label || 'Similar case'} className="w-full h-24 object-cover rounded border border-green-200 group-hover:opacity-90 transition" />
+                                        <ExternalLink className="absolute top-1 right-1 h-3 w-3 text-white bg-black/50 rounded p-0.5" />
+                                      </div>
+                                      {(it.label || it.citation) && (
+                                        <p className="text-[10px] text-green-700 mt-1 line-clamp-1">{it.label}{it.citation ? ` — ${it.citation}` : ''}</p>
+                                      )}
+                                    </a>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
                           </div>
                         ) : (
-                          <p className="text-sm">{msg.content}</p>
+                          <>
+                            {typeof msg.content === 'string' && (msg.content.startsWith('blob:') || msg.content.startsWith('data:image')) ? (
+                              <img src={msg.content} alt="Captured" className="max-w-full rounded-lg border border-green-200" />
+                            ) : (
+                              <p className="text-sm">{msg.content}</p>
+                            )}
+                          </>
                         )}
                         <p className={`text-xs mt-1 ${msg.type === "user" ? "text-green-100" : "text-green-500"}`}>
                           {msg.time}
@@ -588,7 +676,18 @@ export default function ChatPage() {
                 </div>
               )}
 
-              <div className="flex gap-2">
+              <div className="flex gap-2 items-end">
+                {/* Camera button (left side) */}
+                <Button
+                  onClick={openCamera}
+                  disabled={isLoading || isPlayingAudio}
+                  className="rounded-xl px-3 bg-transparent border-2 border-green-200 text-green-700 hover:bg-green-50"
+                  variant="outline"
+                  size="sm"
+                  aria-label="Take photo"
+                >
+                  <Camera className="h-4 w-4" />
+                </Button>
                 <Input
                   value={message}
                   onChange={(e) => setMessage(e.target.value)}
@@ -601,12 +700,12 @@ export default function ChatPage() {
                   }
                   disabled={!isOnline}
                   onKeyPress={(e) => e.key === "Enter" && sendMessage()}
-                  className="flex-1 rounded-xl"
+                  className="flex-1 rounded-xl bg-white border-2 border-green-200 shadow-sm"
                 />
                 <Button
                   onClick={sendMessage}
                   disabled={!isOnline || !message.trim() || isLoading || isPlayingAudio}
-                  className="bg-green-500 hover:bg-green-600 rounded-xl"
+                  className="bg-green-500 hover:bg-green-600 rounded-xl px-4"
                 >
                   {isLoading ? (
                     <div className="h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent" />
@@ -617,120 +716,33 @@ export default function ChatPage() {
                   )}
                 </Button>
 
-                {/* Mobile Live Chat Button */}
+                {/* Inline Mic Button (replaces mobile language selector) */}
                 <Button
                   onClick={isRecording ? stopRecording : startRecording}
                   disabled={isLoading || isPlayingAudio}
-                  className={`rounded-xl transition-all duration-200 ${isRecording
-                    ? 'bg-red-500 hover:bg-red-600 text-white shadow-lg scale-105'
-                    : 'bg-blue-500 hover:bg-blue-600 text-white'
-                    } ${isLoading || isPlayingAudio ? 'opacity-50 cursor-not-allowed' : ''}`}
+                  className={`rounded-xl px-3 transition-all ${
+                    isRecording ? 'bg-red-500 hover:bg-red-600 text-white' : 'bg-blue-500 hover:bg-blue-600 text-white'
+                  } ${isLoading || isPlayingAudio ? 'opacity-50 cursor-not-allowed' : ''}`}
                   size="sm"
+                  aria-label={isRecording ? t('stop') : t('liveChat')}
                 >
-                  <div className="flex items-center gap-2">
-                    {isRecording ? (
-                      <>
-                        <div className="w-3 h-3 bg-white rounded-full animate-pulse"></div>
-                        <span className="font-semibold">{t("stop")}</span>
-                      </>
-                    ) : isLoading ? (
-                      <>
-                        <div className="w-4 h-4 animate-spin rounded-full border-2 border-white border-t-transparent"></div>
-                        <span className="font-semibold">{t("processing")}</span>
-                      </>
-                    ) : isPlayingAudio ? (
-                      <>
-                        <Volume2 className="w-4 h-4 animate-pulse" />
-                        <span className="font-semibold">{t("playing")}</span>
-                      </>
-                    ) : (
-                      <>
-                        <Mic className="w-4 h-4" />
-                        <span className="font-semibold">{t("liveChat")}</span>
-                      </>
-                    )}
-                  </div>
-                </Button>
-
-                {/* Mobile Language Selector */}
-                <div className="relative language-dropdown-container">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="rounded-xl bg-green-50 border-green-200 text-green-700 hover:bg-green-100"
-                    onClick={() => {
-                      console.log('🌍 Opening mobile dropdown, languages:', SUPPORTED_LANGUAGES)
-                      setShowMobileDropdown(!showMobileDropdown)
-                    }}
-                  >
-                    <Globe className="h-4 w-4 mr-1" />
-                    {SUPPORTED_LANGUAGES.find(lang => lang.code === selectedLanguage)?.flag}
-                    <span className="ml-1 text-xs">({selectedLanguage})</span>
-                  </Button>
-
-                  {/* Language Dropdown */}
-                  {showMobileDropdown && (
-                    <div className="absolute top-full left-0 mt-1 bg-white border border-green-200 rounded-lg shadow-xl z-[9999] min-w-[200px] max-h-60 overflow-y-auto">
-                      <div className="p-2 text-xs text-gray-500 border-b bg-white">{t("availableLanguages", { count: SUPPORTED_LANGUAGES.length })}:</div>
-                      {SUPPORTED_LANGUAGES.map((lang) => (
-                        <button
-                          key={lang.code}
-                          onClick={() => {
-                            setSelectedLanguage(lang.code);
-                            setShowMobileDropdown(false);
-                          }}
-                          className={`w-full text-left px-3 py-2 hover:bg-green-50 flex items-center gap-2 bg-white ${selectedLanguage === lang.code ? 'bg-green-100 text-green-700' : 'text-gray-700'
-                            }`}
-                        >
-                          <span>{lang.flag}</span>
-                          <span className="text-sm">{lang.name}</span>
-                        </button>
-                      ))}
-                    </div>
+                  {isRecording ? (
+                    <span className="inline-flex items-center gap-1"><div className="w-2 h-2 bg-white rounded-full animate-pulse"></div>{t('stop')}</span>
+                  ) : (
+                    <Mic className="h-4 w-4" />
                   )}
-                </div>
+                </Button>
               </div>
 
-              {/* Mobile Quick Questions */}
-              <div className="space-y-2">
-                <div className="flex items-center gap-2 text-xs text-green-600">
-                  <Lightbulb className="h-3 w-3" />
-                  <span className="font-medium">{t("quickQuestions")}:</span>
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  {quickQuestions.slice(0, 4).map((item, index) => (
-                    <Badge
-                      key={index}
-                      variant="outline"
-                      className="cursor-pointer hover:bg-green-50 text-green-600 border-green-200 text-xs px-2 py-1"
-                      onClick={() => handleQuickQuestion(item.question)}
-                    >
-                      {item.icon}
-                      <span className="ml-1">{item.text}</span>
-                    </Badge>
-                  ))}
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  {quickQuestions.slice(4, 8).map((item, index) => (
-                    <Badge
-                      key={index + 4}
-                      variant="outline"
-                      className="cursor-pointer hover:bg-green-50 text-green-600 border-green-200 text-xs px-2 py-1"
-                      onClick={() => handleQuickQuestion(item.question)}
-                    >
-                      {item.icon}
-                      <span className="ml-1">{item.text}</span>
-                    </Badge>
-                  ))}
-                </div>
-              </div>
+              {/* Removed Mobile Quick Questions for cleaner UI */}
             </div>
           </CardContent>
         </Card>
+        {/* Removed floating mic; now inline next to Send */}
       </div>
 
       {/* Desktop Layout */}
-      <div className="hidden md:block p-4 lg:p-6 h-[calc(100vh-120px)] flex flex-col gap-6">
+      <div className="hidden md:flex md:flex-col p-4 lg:p-6 h-[calc(100vh-120px)] gap-6">
 
 
         <div className="flex-1 grid grid-cols-1 lg:grid-cols-1 gap-6">
@@ -793,9 +805,35 @@ export default function ChatPage() {
                               >
                                 {msg.content}
                               </ReactMarkdown>
+                              {msg.images && msg.images.length > 0 && (
+                                <div className="mt-3">
+                                  {msg.sectionTitle && (
+                                    <p className="text-xs font-semibold text-green-800 mb-2">{msg.sectionTitle}</p>
+                                  )}
+                                  <div className="grid grid-cols-3 gap-2">
+                                    {msg.images.map((it, idx) => (
+                                      <a key={idx} href={it.url} target="_blank" rel="noopener noreferrer" className="block group">
+                                        <div className="relative">
+                                          <img src={it.url} alt={it.label || 'Similar case'} className="w-full h-20 object-cover rounded border border-green-200 group-hover:opacity-90 transition" />
+                                          <ExternalLink className="absolute top-1 right-1 h-3 w-3 text-white bg-black/50 rounded p-0.5" />
+                                        </div>
+                                        {(it.label || it.citation) && (
+                                          <p className="text-[10px] text-green-700 mt-1 line-clamp-1">{it.label}{it.citation ? ` — ${it.citation}` : ''}</p>
+                                        )}
+                                      </a>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
                             </div>
                           ) : (
-                            <p className="text-sm leading-relaxed">{msg.content}</p>
+                            <>
+                              {typeof msg.content === 'string' && (msg.content.startsWith('blob:') || msg.content.startsWith('data:image')) ? (
+                                <img src={msg.content} alt="Captured" className="max-w-full rounded-lg border border-green-200" />
+                              ) : (
+                                <p className="text-sm leading-relaxed">{msg.content}</p>
+                              )}
+                            </>
                           )}
                           <p className={`text-xs mt-2 ${msg.type === "user" ? "text-green-100" : "text-green-500"}`}>
                             {msg.time}
@@ -826,47 +864,54 @@ export default function ChatPage() {
                   )}
 
                   <div className="flex gap-3">
+                    {/* Camera button (left side) */}
+                    <Button
+                      onClick={openCamera}
+                      disabled={isLoading || isPlayingAudio}
+                      className="rounded-xl bg-transparent border-2 border-green-200 text-green-700 hover:bg-green-50"
+                      variant="outline"
+                      size="sm"
+                      aria-label="Take photo"
+                    >
+                      <Camera className="h-4 w-4" />
+                    </Button>
                     <Button variant="outline" size="sm" className="rounded-xl bg-transparent">
                       <Paperclip className="h-4 w-4" />
                     </Button>
 
-                    {/* Desktop Language Selector */}
-                    <div className="relative language-dropdown-container">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="rounded-xl bg-green-50 border-green-200 text-green-700 hover:bg-green-100"
-                        onClick={() => {
-                          console.log('🌍 Opening desktop dropdown, languages:', SUPPORTED_LANGUAGES)
-                          setShowDesktopDropdown(!showDesktopDropdown)
-                        }}
-                      >
-                        <Globe className="h-4 w-4 mr-1" />
-                        {SUPPORTED_LANGUAGES.find(lang => lang.code === selectedLanguage)?.flag}
-                        <span className="ml-1 text-xs">({selectedLanguage})</span>
-                      </Button>
-
-                      {/* Language Dropdown */}
-                      {showDesktopDropdown && (
-                        <div className="absolute top-full left-0 mt-1 bg-white border border-green-200 rounded-lg shadow-xl z-[9999] min-w-[200px] max-h-60 overflow-y-auto">
-                          <div className="p-2 text-xs text-gray-500 border-b bg-white">{t("availableLanguages", { count: SUPPORTED_LANGUAGES.length })}:</div>
-                          {SUPPORTED_LANGUAGES.map((lang) => (
-                            <button
-                              key={lang.code}
-                              onClick={() => {
-                                setSelectedLanguage(lang.code);
-                                setShowDesktopDropdown(false);
-                              }}
-                              className={`w-full text-left px-3 py-2 hover:bg-green-50 flex items-center gap-2 bg-white ${selectedLanguage === lang.code ? 'bg-green-100 text-green-700' : 'text-gray-700'
-                                }`}
-                            >
-                              <span>{lang.flag}</span>
-                              <span className="text-sm">{lang.name}</span>
-                            </button>
-                          ))}
-                        </div>
-                      )}
-                    </div>
+                    {/* Mic button moved into this slot (replaces desktop language selector) */}
+                    <Button
+                      onClick={isRecording ? stopRecording : startRecording}
+                      disabled={isLoading || isPlayingAudio}
+                      className={`rounded-xl transition-all ${
+                        isRecording ? 'bg-red-500 hover:bg-red-600 text-white' : 'bg-blue-500 hover:bg-blue-600 text-white'
+                      } ${isLoading || isPlayingAudio ? 'opacity-50 cursor-not-allowed' : ''}`}
+                      size="sm"
+                    >
+                      <div className="flex items-center gap-2">
+                        {isRecording ? (
+                          <>
+                            <div className="w-3 h-3 bg-white rounded-full animate-pulse"></div>
+                            <span className="font-semibold">{t("stop")}</span>
+                          </>
+                        ) : isLoading ? (
+                          <>
+                            <div className="w-4 h-4 animate-spin rounded-full border-2 border-white border-t-transparent"></div>
+                            <span className="font-semibold">{t("processing")}</span>
+                          </>
+                        ) : isPlayingAudio ? (
+                          <>
+                            <Volume2 className="w-4 h-4 animate-pulse" />
+                            <span className="font-semibold">{t("playing")}</span>
+                          </>
+                        ) : (
+                          <>
+                            <Mic className="w-4 h-4" />
+                            <span className="font-semibold">{t("liveChat")}</span>
+                          </>
+                        )}
+                      </div>
+                    </Button>
 
                     <Input
                       value={message}
@@ -896,40 +941,7 @@ export default function ChatPage() {
                       )}
                     </Button>
 
-                    {/* Desktop Live Chat Button */}
-                    <Button
-                      onClick={isRecording ? stopRecording : startRecording}
-                      disabled={isLoading || isPlayingAudio}
-                      className={`rounded-xl transition-all duration-200 ${isRecording
-                        ? 'bg-red-500 hover:bg-red-600 text-white shadow-lg scale-105'
-                        : 'bg-blue-500 hover:bg-blue-600 text-white'
-                        } ${isLoading || isPlayingAudio ? 'opacity-50 cursor-not-allowed' : ''}`}
-                      size="sm"
-                    >
-                      <div className="flex items-center gap-2">
-                        {isRecording ? (
-                          <>
-                            <div className="w-3 h-3 bg-white rounded-full animate-pulse"></div>
-                            <span className="font-semibold">{t("stop")}</span>
-                          </>
-                        ) : isLoading ? (
-                          <>
-                            <div className="w-4 h-4 animate-spin rounded-full border-2 border-white border-t-transparent"></div>
-                            <span className="font-semibold">{t("processing")}</span>
-                          </>
-                        ) : isPlayingAudio ? (
-                          <>
-                            <Volume2 className="w-4 h-4 animate-pulse" />
-                            <span className="font-semibold">{t("playing")}</span>
-                          </>
-                        ) : (
-                          <>
-                            <Mic className="w-4 h-4" />
-                            <span className="font-semibold">{t("liveChat")}</span>
-                          </>
-                        )}
-                      </div>
-                    </Button>
+                    {/* Removed duplicate live chat button at the end */}
                   </div>
 
                   {/* Desktop Quick Questions */}
@@ -958,6 +970,15 @@ export default function ChatPage() {
           </Card>
         </div>
       </div>
+      {/* Hidden camera input available for both mobile and desktop */}
+      <input
+        ref={cameraInputRef}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        onChange={handleCameraCapture}
+        className="hidden"
+      />
     </>
   )
 }
